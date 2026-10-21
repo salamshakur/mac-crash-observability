@@ -1,0 +1,61 @@
+# Grafana + Loki for macOS crash events.
+# Runs on an always-on box (Mac mini, Raspberry Pi 4/5 with a 64-bit OS, any Linux server).
+# Full walkthrough: observability/README.md
+#
+#   cp .env.example .env        # set the Grafana admin password
+#   docker compose up -d        # start Loki (port 3100) and Grafana (port 3000)
+#   docker compose logs -f loki # watch Loki's logs
+#   docker compose down         # stop (data is kept in named volumes)
+
+name: mac-crash-observability
+
+services:
+  loki:
+    image: grafana/loki:3.7.5            # pinned: upgrade on purpose, not by accident
+    command: -config.file=/etc/loki/loki-config.yaml
+    ports:
+      - "3100:3100"                       # HTTP API: push (/loki/api/v1/push) and queries
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki-data:/loki                   # chunks + index survive container restarts
+    restart: unless-stopped
+    # Ready check: curl http://<host>:3100/ready  -> "ready"
+
+  grafana:
+    image: grafana/grafana:12.4.6
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in observability/.env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro   # datasource + dashboard loader
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro       # dashboard JSON files
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  # Optional: Grafana Alloy tails data/index.ndjson and ships it to Loki.
+  # Only useful when this stack runs on the SAME Mac that collects the reports.
+  # Enable with: docker compose --profile collector up -d
+  alloy:
+    image: grafana/alloy:v1.17.1
+    profiles: ["collector"]
+    command: run --server.http.listen-addr=0.0.0.0:12345 --storage.path=/var/lib/alloy/data /etc/alloy/config.alloy
+    ports:
+      - "12345:12345"                     # Alloy's own UI: live view of the pipeline
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - ../data:/data:ro                  # the repo's data/ folder (index.ndjson)
+      - alloy-data:/var/lib/alloy/data    # remembers how far it has read the file
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+volumes:
+  loki-data:
+  grafana-data:
+  alloy-data:

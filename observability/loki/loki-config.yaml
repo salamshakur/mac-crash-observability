@@ -1,0 +1,47 @@
+# Loki 3.x, single-binary ("monolithic") mode: every Loki component in one process,
+# storing data on the local filesystem. Right-sized for one person's crash history.
+# Reference: https://grafana.com/docs/loki/latest/configure/
+
+auth_enabled: false            # single tenant; put a reverse proxy in front if exposed beyond your LAN
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: info
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1        # one copy, since there's only one node
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01         # applies to all data newer than this date
+      store: tsdb              # index format recommended for Loki 3
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # Crash reports are often days old when we ship them. By default Loki rejects
+  # samples older than 1 week; turn that off so history can be backfilled.
+  reject_old_samples: false
+  allow_structured_metadata: true
+  volume_enabled: true
+  retention_period: 0s         # 0 = keep forever (crash history is tiny)
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: false
+
+analytics:
+  reporting_enabled: false     # don't send usage stats to Grafana Labs

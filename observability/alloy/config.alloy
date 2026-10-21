@@ -1,0 +1,55 @@
+// Grafana Alloy pipeline: tail data/index.ndjson and ship each line to Loki.
+// Optional alternative to scripts/push_to_loki.py (see observability/README.md).
+// Components are wired together: each one's output is the next one's input.
+
+// 1. Find the file(s) to read.
+local.file_match "crash_index" {
+  path_targets = [{
+    "__path__" = "/data/index.ndjson",
+    "job"      = "mac-crash",
+  }]
+}
+
+// 2. Tail them. Alloy remembers its read position in --storage.path,
+//    so restarts don't re-send lines.
+loki.source.file "crash_index" {
+  targets    = local.file_match.crash_index.targets
+  forward_to = [loki.process.crash_index.receiver]
+  // build_index.py rewrites the whole file; start from the beginning on first sight
+  tail_from_end = false
+}
+
+// 3. Parse each JSON line: use the event's own timestamp (not "now"),
+//    and promote a few low-cardinality fields to labels.
+loki.process "crash_index" {
+  stage.json {
+    expressions = {
+      ts       = "ts",
+      category = "category",
+      source   = "source",
+      host     = "host",
+    }
+  }
+
+  stage.timestamp {
+    source = "ts"
+    format = "RFC3339"
+  }
+
+  stage.labels {
+    values = {
+      category = "",
+      source   = "",
+      host     = "",
+    }
+  }
+
+  forward_to = [loki.write.local.receiver]
+}
+
+// 4. Send to Loki.
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

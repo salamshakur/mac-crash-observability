@@ -1,0 +1,11 @@
+# Grafana reads this at startup and creates the Loki data source automatically.
+apiVersion: 1
+datasources:
+  - name: Loki
+    uid: loki                  # fixed uid so dashboards can reference it
+    type: loki
+    access: proxy              # Grafana's server talks to Loki; your browser never does
+    url: http://loki:3100      # "loki" = the compose service name (Docker DNS)
+    isDefault: true
+    jsonData:
+      maxLines: 5000

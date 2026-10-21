@@ -1,0 +1,15 @@
+# Machine identifiers. Never publish.
+.env
+observability/.env
+
+# Raw reports and system info contain serial number, hardware UUID, username, hostname
+data/raw/
+data/system-info/
+data/.loki_pushed
+data/*.private.*
+
+# Local/OS noise
+.DS_Store
+__pycache__/
+*.pyc
+*.tgz

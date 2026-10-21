@@ -1,0 +1,9 @@
+# Load every dashboard JSON in /etc/grafana/dashboards (mounted from grafana/dashboards/).
+apiVersion: 1
+providers:
+  - name: mac-crash
+    folder: Mac crashes
+    type: file
+    allowUiUpdates: true       # you can edit in the UI; export JSON back to the repo to keep changes
+    options:
+      path: /etc/grafana/dashboards
