@@ -72,5 +72,5 @@ if [ "$(current HOST_LABEL)" = "my-mac" ] || [ -z "$(current HOST_LABEL)" ]; the
   set_kv HOST_LABEL "$(sysctl -n hw.model | tr 'A-Z,' 'a-z-')"
 fi
 
-echo "Done. .env is ready (gitignored). Review it with: open -e \"$ENV_FILE\""
+echo "Done. .env is ready (gitignored). Review it with: open -e .env"
 echo "Next: set LOKI_URL in .env to your Mac mini / Raspberry Pi, then run scripts/update.sh"

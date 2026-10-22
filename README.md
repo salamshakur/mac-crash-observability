@@ -1,20 +1,67 @@
 # mac-crash-observability
 
-Collect every crash and kernel panic report a Mac writes, normalize them into one event stream,
-and chart them in **Grafana** backed by **Loki**. The goal is to see patterns (which subsystem panics, which
-processes die and how, whether storage reads are failing) instead of reading reports one at a time.
+My 2019 16-inch MacBook Pro has kernel-panicked once or twice a week for about two years, through factory
+resets and clean macOS installs. Apple writes a detailed report for every crash, but reading them one at a time
+never showed a pattern. So I built a pipeline that collects every report the Mac writes, normalizes them into one
+event stream, and charts them in **Grafana** backed by **Loki**.
 
-Built while diagnosing a 2019 16" MacBook Pro (MacBookPro16,1) that kept kernel-panicking across clean macOS
-reinstalls. That investigation is in [`docs/investigation-2026-10-21.md`](docs/investigation-2026-10-21.md).
+**What it surfaced in the first week of data:**
+
+- 2 kernel panics 19 minutes apart, in **unrelated** kernel subsystems (GPU acceleration, then the filesystem layer).
+  The second came 11 minutes after a fresh boot.
+- 60 **identical** APFS hash mismatches on the sealed system volume: the same 16 KB block read back the same
+  wrong bytes every time.
+- Crashes in five different system processes that faulted **inside that exact block**.
+- 26 kills of Apple's own processes for an invalid code signature on a page of code.
+- Apple Diagnostics, run the same afternoon: "No issues found."
+
+That combination (intermittent faults across unrelated parts of the system, while on-demand tests pass) is
+exactly what a single report or a one-off hardware test misses, and why the history matters.
+
+## Who it's for
+
+| Who | What they get |
+|---|---|
+| Anyone whose Mac crashes, freezes or restarts on its own | A timeline that separates "one misbehaving app" from "the system itself is failing", plus evidence to bring to a repair |
+| Me, ongoing | A before/after record: does a repair, reinstall or macOS update actually stop the crashes? |
+| People learning observability | A small but complete pipeline on real data (collect → normalize → scrub → ship → store → visualize), documented line by line in [`observability/README.md`](observability/README.md) |
+
+It isn't much use on a healthy Mac, which writes very few reports worth charting.
+
+## How it works
 
 ```
- MacBook (the crashing Mac)                                  Mac mini / Raspberry Pi (always on)
- ┌───────────────────────────────────────────────┐          ┌──────────────────────────────────┐
- │ /Library/Logs/DiagnosticReports   ─┐          │          │  Loki  :3100  (stores events)    │
- │ ~/Library/Logs/DiagnosticReports  ─┼─ update.sh ─► data/index.ndjson ── push_to_loki.py ─►  │
- │ kernel log (log show)             ─┘          │   HTTP   │  Grafana :3000 (dashboards)      │
- └───────────────────────────────────────────────┘          └──────────────────────────────────┘
+ ┌──────────────────────────── on the MacBook ────────────────────────────┐   ┌──── Mac mini / Raspberry Pi ────┐
+ launchd (hourly) ─► update.sh ─► data/raw/ ─► build_index.py ─► index.ndjson ─► push_to_loki.py ──HTTP──► Loki ◄── Grafana
 ```
+
+1. **launchd** (macOS's built-in scheduler) runs `update.sh` every hour and at login.
+2. `update.sh` copies new reports from macOS's DiagnosticReports folders and scans the kernel log since its last run.
+3. `build_index.py` turns 8 different report formats into one schema, converts times to UTC, and replaces every
+   machine identifier with a placeholder.
+4. `push_to_loki.py` sends events Loki hasn't seen yet.
+5. **Loki** stores them; **Grafana** queries Loki and draws the dashboard.
+
+## The stack
+
+| Layer | Component | What it does here | Why this choice |
+|---|---|---|---|
+| Schedule | launchd LaunchAgent | Runs `update.sh --scheduled` hourly and at login | Built into macOS, survives reboots, runs a missed job when the Mac wakes. Nothing extra to keep alive on a machine that crashes |
+| Collect | zsh + macOS tools (`cp`, `/usr/bin/log`, `pmset`, `ioreg`) | Copies reports, scans the kernel log | Nothing to install; read-only on the system |
+| Normalize | `build_index.py` (Python standard library) | One schema, UTC timestamps, identifier scrubbing | Runs on the `python3` that ships with Xcode Command Line Tools; no dependencies |
+| Format | NDJSON (one JSON event per line) | The hand-off between collection and shipping | What log pipelines and Loki's push API consume; readable diffs in git; works with `jq` |
+| Ship | `push_to_loki.py` | POSTs new events to Loki, remembers what it sent | A one-shot script fits a Mac that may crash mid-run. Grafana Alloy, the standard collection agent, is included as an optional alternative |
+| Store | Loki 3.7 | Stores events, indexed by 4 labels | Indexes labels rather than full text, so its footprint suits a Raspberry Pi; queried with LogQL |
+| Visualize + alert | Grafana 12.4 | Crash overview dashboard; alerting | Data source and dashboard are provisioned from files in this repo |
+| Run | Docker Compose | Starts Loki + Grafana with pinned versions | One file for a Mac mini (Docker Desktop, OrbStack or Colima) or a 64-bit Raspberry Pi |
+| Guard | git pre-commit hook | Blocks commits that contain any identifier from `.env` | Public repo, private data |
+
+**Why not Splunk, Datadog or Elasticsearch?** Splunk Enterprise doesn't run on ARM or macOS (only its forwarder
+does), so it can't be hosted on a Pi or an Apple-silicon Mac mini, and its free license has no alerting or
+logins. Datadog's free plan doesn't include logs. Elasticsearch/OpenSearch work but are far heavier than a few
+hundred events need. Grafana Cloud's free tier keeps logs for 14 days, and crash patterns play out over months.
+The full comparison, plus what Loki, Grafana and Alloy are, is in
+[`observability/README.md`](observability/README.md#5-why-this-stack-and-not-something-else).
 
 ## Quick start (on the Mac you want to monitor)
 
@@ -24,22 +71,35 @@ No pip packages are needed.
 ```bash
 git clone https://github.com/salamshakur/mac-crash-observability.git
 cd mac-crash-observability
-
-scripts/setup_env.sh            # creates .env and fills in this Mac's serial, UUID, names, timezone
-scripts/install_hooks.sh        # blocks commits that would contain those identifiers
-scripts/update.sh               # copy reports into data/raw/ and build data/index.ndjson
-scripts/collect_system_info.sh  # optional, slow: kernel log, shutdown causes, SSD/GPU info
+scripts/setup_env.sh
+scripts/install_hooks.sh
+scripts/update.sh
+scripts/install_schedule.sh
 ```
 
-After **every crash or restart**, run:
+In order: create `.env` with this Mac's identifiers; block commits that would contain them; do a first collection
+(asks for your password once); collect automatically from now on. Avoid cloning into Documents, Desktop or
+Downloads, because macOS privacy protection blocks background jobs there.
 
-```bash
-scripts/update.sh          # or: scripts/update.sh --push   to also send new events to Loki
-```
+Then, on an always-on machine, start Loki + Grafana by following
+[`observability/README.md`](observability/README.md#6-run-it-on-a-mac-mini-or-raspberry-pi), and set `LOKI_URL`
+in `.env`. Scheduled runs start pushing as soon as it's set.
 
-To get the dashboards, start the Grafana + Loki stack on another machine. See
-[`observability/README.md`](observability/README.md), a step-by-step guide that also explains
-what Loki and Grafana are and how every line of the compose file works.
+## Scripts
+
+All scripts live in `scripts/` and run from the repo root. Apart from `install_hooks.sh` (writes `.git/hooks/`)
+and `install_schedule.sh` (writes `~/Library/LaunchAgents/`), nothing touches the Mac outside this folder.
+
+| Script | When to run | Reads | Writes | Notes |
+|---|---|---|---|---|
+| `setup_env.sh` | Once per Mac; `--force` after renaming the Mac | `ioreg`, `scutil`, `hostname`, `sysctl`, `/etc/localtime` | `.env` (mode 600) | Read-only on the system. Masks values in its output |
+| `install_hooks.sh` | Once per clone | – | `.git/hooks/pre-commit` | Makes every `git commit` run `check_public.sh --staged` |
+| `install_schedule.sh` | Once per Mac | – | `~/Library/LaunchAgents/io.github.mac-crash-observability.update.plist` | Runs `update.sh --scheduled` hourly and at login. `--status`, `--uninstall`; `INTERVAL=1800` for every 30 min. Log: `data/logs/update.log` |
+| `update.sh` | Automatically (scheduled), or by hand after a crash | DiagnosticReports folders, `.contents.panic`, kernel log since the last run | new files in `data/raw/` and `data/system-info/kernel-log/`, then runs `build_index.py` | Never overwrites, so re-running is safe. By hand it asks for your password for the T2 copies; `--scheduled` never prompts and skips them. `--push` sends to Loki |
+| `collect_system_info.sh` | While investigating (takes minutes) | unified log, `pmset`, `system_profiler`, `diskutil`, `csrutil` | `data/system-info/<timestamp>/`, then runs `build_index.py` | Deep dive: long kernel-log windows, full shutdown-cause history, SSD/GPU/RAM details. Optional arg: log window, e.g. `30d` |
+| `build_index.py` | Called by the scripts above | `data/raw/`, `data/system-info/`, `.env` | `data/index.ndjson` | Parses every report type, converts times to UTC, scrubs identifiers. Prints counts per category |
+| `push_to_loki.py` | Via `update.sh`, or by hand | `data/index.ndjson`, `LOKI_URL` in `.env` | `data/.loki_pushed` (IDs already sent) | `--dry-run` shows the payload; `--all` resends everything (use on an empty Loki) |
+| `check_public.sh` | Automatically before each commit; by hand before pushing | `.env`, files git would publish | – | Exits non-zero and lists files if any identifier is found |
 
 ## Repo layout
 
@@ -47,18 +107,13 @@ what Loki and Grafana are and how every line of the compose file works.
 |---|---|---|
 | `.env.example` | Template of settings and machine identifiers | yes |
 | `.env` | Your values, filled by `setup_env.sh` | **no** |
-| `scripts/setup_env.sh` | Detects serial, hardware UUID, username, hostnames, model, timezone | yes |
-| `scripts/update.sh` | Copies new reports, saves the latest panic, rebuilds the index, optional `--push` | yes |
-| `scripts/collect_system_info.sh` | Saves kernel-log excerpts, shutdown causes, `system_profiler` output | yes |
-| `scripts/build_index.py` | Parses all reports into `data/index.ndjson` + `data/index.csv`, scrubbing identifiers | yes |
-| `scripts/push_to_loki.py` | Sends new events to Loki's push API | yes |
-| `scripts/check_public.sh` | Fails if any `.env` identifier appears in tracked/staged files | yes |
-| `scripts/install_hooks.sh` | Installs `check_public.sh` as a git pre-commit hook | yes |
+| `scripts/` | Collection, indexing, shipping, scheduling and safety scripts | yes |
 | `data/raw/{system,user,bridge}/` | Untouched copies of Apple's reports | **no** |
-| `data/system-info/<timestamp>/` | Output of `collect_system_info.sh` | **no** |
-| `data/index.ndjson`, `data/index.csv` | Normalized events, identifiers replaced by placeholders | yes |
-| `observability/` | Docker Compose stack: Loki, Grafana, optional Alloy, dashboard | yes |
-| `docs/` | Write-ups of investigations | yes |
+| `data/system-info/` | Kernel-log scans and `collect_system_info.sh` output | **no** |
+| `data/logs/` | Output of scheduled runs | **no** |
+| `data/index.ndjson` | Normalized events, identifiers replaced by placeholders | yes |
+| `observability/` | Docker Compose stack: Loki, Grafana, optional Alloy, dashboard, study guide | yes |
+| `AGENTS.md`, `CLAUDE.md` | Rules for AI coding agents working in this repo | yes |
 
 ## Privacy model
 
@@ -113,18 +168,15 @@ jq -r 'select(.category=="app_crash") | .process' data/index.ndjson | sort | uni
 jq -s 'group_by(.category) | map({(.[0].category): length}) | add' data/index.ndjson
 ```
 
-## Grafana + Loki in one paragraph
+## Roadmap
 
-**Loki** is a log database from Grafana Labs. Unlike Elasticsearch it does **not** index the text of each
-log line. It indexes only a few **labels** (here: `job`, `host`, `category`, `source`) and stores the lines as
-compressed chunks, then filters and parses them at query time with **LogQL** (`{category="app_crash"} | json | signal="SIGBUS"`).
-That makes it cheap to run on a Raspberry Pi. **Grafana** is the UI that queries Loki and draws the dashboards.
-**Grafana Alloy** is Grafana's collection agent; its predecessor Promtail reached end of life on March 2, 2026.
-Loki is common in teams that already run Prometheus/Grafana. ELK/OpenSearch, Splunk and Datadog are other widely
-used choices. The full explanation and setup are in [`observability/README.md`](observability/README.md).
+- [x] Hourly collection via launchd
+- [ ] Grafana alert rule for kernel panics, provisioned from the repo
+- [ ] Battery and thermal history from `pmset -g log`
+- [ ] Decode shutdown-stall spindumps into readable stacks
 
-## Contributing / using it on your own Mac
+## Using it on your own Mac
 
-Fork it, run the quick start, and your identifiers stay in your own `.env`. Report formats change between
+Fork it and run the quick start; your identifiers stay in your own `.env`. Report formats change between
 macOS versions. If `build_index.py` emits `category: parse_error` events, open an issue with the
-(scrubbed!) error field.
+(scrubbed) error field.

@@ -16,6 +16,7 @@ dashboards. See `README.md` (usage, event schema) and `observability/README.md` 
 - Before committing, run `scripts/check_public.sh` (the pre-commit hook does this when installed via
   `scripts/install_hooks.sh`).
 - Raw reports in `data/raw/` are evidence: read them, never modify or delete them.
+- `update.sh --scheduled` runs unattended under launchd: it must never prompt (use `sudo -n`), and must stay fast.
 
 ## Conventions
 - Python: standard library only, compatible with Python 3.9 (the Xcode CLT python3). No pip deps.
@@ -29,7 +30,9 @@ dashboards. See `README.md` (usage, event schema) and `observability/README.md` 
 
 ## Useful commands
 ```bash
-python3 scripts/build_index.py              # rebuild data/index.ndjson + data/index.csv
+scripts/install_schedule.sh --status      # is the hourly LaunchAgent loaded? last exit code
+tail -f data/logs/update.log              # output of scheduled runs
+python3 scripts/build_index.py              # rebuild data/index.ndjson
 python3 scripts/push_to_loki.py --dry-run   # inspect Loki payloads
 scripts/check_public.sh                     # identifier scan of tracked files
 jq -s 'group_by(.category) | map({(.[0].category): length}) | add' data/index.ndjson

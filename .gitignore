@@ -6,6 +6,8 @@ observability/.env
 data/raw/
 data/system-info/
 data/.loki_pushed
+data/.last_log_scan
+data/logs/
 data/*.private.*
 
 # Local/OS noise
@@ -13,3 +15,4 @@ data/*.private.*
 __pycache__/
 *.pyc
 *.tgz
+data/index.ndjson.tmp

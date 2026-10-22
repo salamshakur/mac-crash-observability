@@ -10,13 +10,11 @@ Reads (all paths relative to the repo root):
 
 Writes:
   data/index.ndjson  one JSON event per line, identifiers scrubbed (safe to publish)
-  data/index.csv     the same events, flattened, for spreadsheets
 
 Every machine identifier listed in .env (serial, hardware UUID, username, hostnames)
 is replaced with a placeholder such as <SERIAL> before anything is written.
 Standard library only; works with the python3 that ships with Xcode Command Line Tools (3.9+).
 """
-import csv
 import datetime as dt
 import glob
 import hashlib
@@ -428,9 +426,6 @@ def collect():
     return events
 
 
-CSV_COLS = ["ts", "category", "source", "process", "exception", "exception_type", "signal", "subtype_normalized",
-            "panic_subsystem", "panic_reason_normalized", "top_frame", "fault_region", "resource", "detail",
-            "shutdown_cause", "shutdown_cause_text", "volume", "offset", "inode", "host", "os_build", "file", "event_id"]
 
 
 def main():
@@ -438,13 +433,14 @@ def main():
         print("warning: no .env found. Run scripts/setup_env.sh first so identifiers get scrubbed.", file=sys.stderr)
     events = collect()
     os.makedirs(DATA, exist_ok=True)
-    with open(os.path.join(DATA, "index.ndjson"), "w") as f:
+    # write to a temp file, then atomically replace, so a crash mid-write never leaves a half-written index
+    out = os.path.join(DATA, "index.ndjson")
+    with open(out + ".tmp", "w") as f:
         for e in events:
             f.write(json.dumps({k: v for k, v in e.items() if v is not None}, sort_keys=True) + "\n")
-    with open(os.path.join(DATA, "index.csv"), "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_COLS, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(events)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(out + ".tmp", out)
     counts = {}
     for e in events:
         counts[e["category"]] = counts.get(e["category"], 0) + 1
