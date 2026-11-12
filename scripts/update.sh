@@ -87,6 +87,29 @@ else
 fi
 echo "$NOW" > "$STATE"
 
+# 3b. Sleep, wake and boot lines from `pmset -g log` (macOS keeps only about a week, and this takes about a
+# second). Only the Sleep / Wake / DarkWake / Start / ShutdownCause lines are kept, and only those newer than
+# the previous run (minus a 10-minute overlap; build_index.py drops duplicates). The log's session-UUID lines
+# are identifiers and are not kept.
+PSTATE="$DATA/.last_pmset_scan"
+PDIR="$DATA/system-info/pmset"
+mkdir -p "$PDIR"
+PSTART="$(cat "$PSTATE" 2>/dev/null)"
+[ -n "$PSTART" ] && PSTART="$(date -j -v-10M -f '%Y-%m-%d %H:%M:%S' "$PSTART" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+POUT="$PDIR/$(date '+%Y%m%d-%H%M%S').txt"
+PLOG="$(/usr/bin/pmset -g log 2>/dev/null)"
+if [ -n "$PLOG" ]; then     # an empty result means pmset failed: keep the old watermark and retry next run
+  print -r -- "$PLOG" \
+    | grep -E $'^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} [-+][0-9]{4} (Sleep|Wake|DarkWake|Start|ShutdownCause)[ ]*\t' \
+    | awk -v s="$PSTART" 's == "" || ($1 " " $2) >= s' > "$POUT"
+  echo "$NOW" > "$PSTATE"
+  if [ -s "$POUT" ]; then
+    echo "pmset log: $(wc -l < "$POUT" | tr -d ' ') sleep/wake/boot lines since ${PSTART:-the start of the log}"
+  else
+    rm -f "$POUT"
+  fi
+fi
+
 # 4. Index
 python3 "$ROOT/scripts/build_index.py" || exit 1
 

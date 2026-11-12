@@ -7,6 +7,7 @@ data/raw/
 data/system-info/
 data/.loki_pushed
 data/.last_log_scan
+data/.last_pmset_scan
 data/logs/
 data/*.private.*
 
