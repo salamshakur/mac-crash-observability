@@ -95,11 +95,11 @@ and `install_schedule.sh` (writes `~/Library/LaunchAgents/`), nothing touches th
 | `setup_env.sh` | Once per Mac; `--force` after renaming the Mac | `ioreg`, `scutil`, `hostname`, `sysctl`, `/etc/localtime` | `.env` (mode 600) | Read-only on the system. Masks values in its output |
 | `install_hooks.sh` | Once per clone | – | `.git/hooks/pre-commit` | Makes every `git commit` run `check_public.sh --staged` |
 | `install_schedule.sh` | Once per Mac | – | `~/Library/LaunchAgents/io.github.mac-crash-observability.update.plist` | Runs `update.sh --scheduled` hourly and at login. `--status`, `--uninstall`; `INTERVAL=1800` for every 30 min. Log: `data/logs/update.log` |
-| `update.sh` | Automatically (scheduled), or by hand after a crash | DiagnosticReports folders, `.contents.panic`, kernel log since the last run | new files in `data/raw/` and `data/system-info/kernel-log/`, then runs `build_index.py` | Never overwrites, so re-running is safe. By hand it asks for your password for the T2 copies; `--scheduled` never prompts and skips them. `--push` sends to Loki |
+| `update.sh` | Automatically (scheduled), or by hand after a crash | DiagnosticReports folders, `.contents.panic`, kernel log and `pmset -g log` since the last run | new files in `data/raw/`, `data/system-info/kernel-log/` and `data/system-info/pmset/`, then runs `build_index.py` | Never overwrites, so re-running is safe. By hand it asks for your password for the T2 copies; `--scheduled` never prompts and skips them. `--push` sends to Loki |
 | `collect_system_info.sh` | While investigating (takes minutes) | unified log, `pmset`, `system_profiler`, `diskutil`, `csrutil` | `data/system-info/<timestamp>/`, then runs `build_index.py` | Deep dive: long kernel-log windows, full shutdown-cause history, SSD/GPU/RAM details. Optional arg: log window, e.g. `30d` |
 | `build_index.py` | Called by the scripts above | `data/raw/`, `data/system-info/`, `.env` | `data/index.ndjson` | Parses every report type, converts times to UTC, scrubs identifiers. Prints counts per category |
 | `push_to_loki.py` | Via `update.sh`, or by hand | `data/index.ndjson`, `LOKI_URL` in `.env` | `data/.loki_pushed` (IDs already sent) | `--dry-run` shows the payload; `--all` resends everything (use on an empty Loki) |
-| `check_public.sh` | Automatically before each commit; by hand before pushing | `.env`, files git would publish | – | Exits non-zero and lists files if any identifier is found |
+| `check_public.sh` | Automatically before each commit; by hand before pushing | `.env`, per-report identifiers in `data/raw/`, files git would publish | – | Exits non-zero and lists files if any identifier is found |
 
 ## Repo layout
 
@@ -109,7 +109,7 @@ and `install_schedule.sh` (writes `~/Library/LaunchAgents/`), nothing touches th
 | `.env` | Your values, filled by `setup_env.sh` | **no** |
 | `scripts/` | Collection, indexing, shipping, scheduling and safety scripts | yes |
 | `data/raw/{system,user,bridge}/` | Untouched copies of Apple's reports | **no** |
-| `data/system-info/` | Kernel-log scans and `collect_system_info.sh` output | **no** |
+| `data/system-info/` | Kernel-log scans, `pmset` sleep/wake/boot lines and `collect_system_info.sh` output | **no** |
 | `data/logs/` | Output of scheduled runs | **no** |
 | `data/index.ndjson` | Normalized events, identifiers replaced by placeholders | yes |
 | `observability/` | Docker Compose stack: Loki, Grafana, optional Alloy, dashboard, study guide | yes |
@@ -153,12 +153,36 @@ Every event has `ts` (ISO-8601 UTC), `category`, `source`, `process`, `host`, `f
 |---|---|---|
 | `kernel_panic` | `.contents.panic` (saved as `*_kernel.panic`) | `panic_subsystem` (first kext in backtrace), `panic_reason`, `exception`, `process`, `uptime_s`, `hibernation_exit_count` |
 | `t2_panic_copy` | `ProxiedDevice-Bridge/panic-full-*.ips` | `caused_by`, `bridge_os`. The T2 chip's copy of a macOS panic, so **don't add these to panic counts** |
-| `app_crash` | `*.ips` (bug_type 309) | `exception_type`, `signal`, `subtype`, `top_frame`, `faulting_image`, `fault_region`, `fs_pagein_error`, `codesign_invalid`, `responsible` |
+| `app_crash` | `*.ips` (bug_type 309) | `exception_type`, `signal`, `subtype`, `top_frame`, `faulting_image`, `fault_region`, `fs_pagein_error`, `codesign_invalid`, `responsible`, plus the context fields below |
+| `power_event` | `pmset -g log` | `power_event` (`sleep`, `wake`, `darkwake`), `reason`, `wake_from`, `power_source`, `charge_pct`, `secs_printed` (the number macOS prints on the line; its meaning isn't asserted) |
+| `boot` | `pmset -g log` | One per "powerd process is started" line; `smc_shutdown_cause` (+ `_text` only when macOS printed text) from the shutdown-cause line just before it |
 | `resource_report` | `*.diag` | `resource` (`cpu usage`, `disk writes`), `detail`, `action_taken` |
 | `jetsam` | `JetsamEvent-*.ips` | `largest_process` (killed for memory pressure) |
 | `shutdown_stall` | `*.shutdownStall` | binary spindump; open with `spindump -i <file>` |
 | `apfs_hash_mismatch` | kernel log | `volume`, `inode`, `offset`, `bytes`, `expected_hash`, `got_hash` |
 | `shutdown_cause` | kernel log + `pmset -g log` | `shutdown_cause` code; `shutdown_cause_text` only when macOS printed one |
+
+### Context fields on `app_crash`
+
+These sit in the JSON line (query them with `| json`; they are never Loki labels) and appear only when the report
+has them. They are facts from the report, not conclusions.
+
+| Field | From | Notes |
+|---|---|---|
+| `uptime_s` | `uptime` | Seconds since boot, as macOS rounds it |
+| `since_wake_s` | `wakeTime` | Seconds since the last wake; absent right after a boot |
+| `proc_age_s` | `ts` minus `procLaunch` | `ts` is when the report was written, a few seconds after the crash |
+| `boot_id` | `bootSessionUUID` | First 8 hex digits of its SHA-1. The identifier itself is never written |
+| `thread_count` | `threads` | |
+| `abort_message` | `asi` | `SIGABRT` reports only |
+| `exception_codes` | `exception.codes` | `EXC_GUARD` reports only |
+| `os_train` | `osVersion.train` | e.g. `macOS 26.3.2` |
+| `fault_address`, `fault_in_shared_cache` | second value of `exception.codes`; `sharedCache` base and size | `EXC_BAD_ACCESS` reports, including the ones with no `faultingThread`, where no frame is guessed |
+| `signature` | derived | SHA-1 prefix of signal + normalized subtype + the top 3 frame symbols of the faulting thread, or `fault_address` when there are no frames. Same fault in different processes gets the same signature |
+
+`crashReporterKey`, `storeInfo.deviceIdentifierForVendor`, `sleepWakeUUID` and `bootSessionUUID` are treated as
+identifiers: never written to the index, scrubbed from every string if one ever slipped in, and searched for in tracked
+files by `check_public.sh`.
 
 Handy queries without any dashboard:
 
@@ -171,8 +195,11 @@ jq -s 'group_by(.category) | map({(.[0].category): length}) | add' data/index.nd
 ## Roadmap
 
 - [x] Hourly collection via launchd
+- [x] Sleep, wake and boot events from `pmset -g log`
+- [x] Dashboard panels for boot sessions, time since wake, fault addresses and signature clusters
 - [ ] Grafana alert rule for kernel panics, provisioned from the repo
 - [ ] Battery and thermal history from `pmset -g log`
+- [ ] Capture the T2 (bridge) panic copies from a scheduled run (they need an admin password today)
 - [ ] Decode shutdown-stall spindumps into readable stacks
 
 ## Using it on your own Mac
