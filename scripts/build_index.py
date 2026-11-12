@@ -91,12 +91,37 @@ def _build_scrub_rules():
 
 SCRUB_RULES = _build_scrub_rules()
 
+# Report fields that identify this Mac, its owner's install or a login/boot session. Their values are never
+# copied into the index. As a second line of defence every value met while parsing is also scrubbed out of
+# every string that does get written, and check_public.sh greps tracked files for them
+# (`build_index.py --emit-identifiers`, internal use).
+IDENTIFIER_FIELDS = ("crashReporterKey", "sleepWakeUUID", "bootSessionUUID")
+SEEN_IDENTIFIERS = set()
+_ident_rx = [None, 0]  # compiled alternation, and how many identifiers it was built from
+
+
+def note_identifiers(body):
+    vals = [body.get(k) for k in IDENTIFIER_FIELDS]
+    vals.append((body.get("storeInfo") or {}).get("deviceIdentifierForVendor"))
+    for v in vals:
+        if isinstance(v, str) and len(v) >= 8:
+            SEEN_IDENTIFIERS.add(v)
+
+
+def _scrub_seen_identifiers(s):
+    if not SEEN_IDENTIFIERS:
+        return s
+    if _ident_rx[0] is None or _ident_rx[1] != len(SEEN_IDENTIFIERS):
+        _ident_rx[0] = re.compile("|".join(re.escape(v) for v in sorted(SEEN_IDENTIFIERS, key=len, reverse=True)), re.I)
+        _ident_rx[1] = len(SEEN_IDENTIFIERS)
+    return _ident_rx[0].sub("<ID>", s)
+
 
 def scrub(obj):
     if isinstance(obj, str):
         for rx, rep in SCRUB_RULES:
             obj = rx.sub(rep, obj)
-        return obj
+        return _scrub_seen_identifiers(obj)
     if isinstance(obj, dict):
         return {k: scrub(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -257,8 +282,85 @@ def bridge_panic(path):
     }
 
 
+def iso_to_dt(iso):
+    return dt.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def exception_fault_address(ex):
+    """Second value of exception.codes (for EXC_BAD_ACCESS this is the address that faulted), as an int."""
+    vals = re.findall(r"0x[0-9a-fA-F]+", ex.get("codes") or "")
+    if len(vals) >= 2:
+        return int(vals[1], 16)
+    raw = ex.get("rawCodes")
+    if isinstance(raw, list) and len(raw) >= 2 and isinstance(raw[1], int):
+        return raw[1]
+    return None
+
+
+def frame_symbols(b, limit=3):
+    """Symbols of the first frames of the faulting thread. Empty when the report names no faulting thread:
+    we never guess a frame. A frame without a symbol is written as image+offset."""
+    imgs, threads, ft = b.get("usedImages", []), b.get("threads", []), b.get("faultingThread")
+    if not isinstance(ft, int) or ft >= len(threads):
+        return []
+    out = []
+    for fr in threads[ft].get("frames", [])[:limit]:
+        ii = fr.get("imageIndex")
+        image = imgs[ii].get("name") if isinstance(ii, int) and ii < len(imgs) else "?"
+        out.append(fr.get("symbol") or "%s+%s" % (image, fr.get("imageOffset", "?")))
+    return out
+
+
+def crash_context_fields(h, b, ev):
+    """Fields that help separate hardware-looking from software-looking crashes. JSON line only, never Loki
+    labels, and only written when the report actually has them."""
+    out = {}
+    if isinstance(b.get("uptime"), (int, float)):
+        out["uptime_s"] = int(b["uptime"])
+    if isinstance(b.get("wakeTime"), (int, float)):
+        out["since_wake_s"] = int(b["wakeTime"])
+    launch = parse_ts(b.get("procLaunch"))
+    # some reports print the Unix epoch (1969-12-31 / 1970-01-01) when the launch time is unknown
+    if launch and launch >= "2001-01-01" and ev.get("ts"):
+        age = (iso_to_dt(ev["ts"]) - iso_to_dt(launch)).total_seconds()
+        if age >= 0:
+            out["proc_age_s"] = round(age, 1)
+    if isinstance(b.get("bootSessionUUID"), str):
+        # one-way hash: groups reports by boot without writing the session identifier
+        out["boot_id"] = hashlib.sha1(b["bootSessionUUID"].encode()).hexdigest()[:8]
+    if b.get("threads"):
+        out["thread_count"] = len(b["threads"])
+    os_train = (b.get("osVersion") or {}).get("train")
+    if os_train:
+        out["os_train"] = os_train
+    ex = b.get("exception") or {}
+    if ev.get("signal") == "SIGABRT" and isinstance(b.get("asi"), dict):
+        msgs = [str(m) for v in b["asi"].values() for m in (v if isinstance(v, list) else [v])]
+        if msgs:
+            out["abort_message"] = "; ".join(msgs)[:300]
+    if ex.get("type") == "EXC_GUARD" and ex.get("codes"):
+        out["exception_codes"] = ex["codes"]
+    addr = exception_fault_address(ex) if ex.get("type") == "EXC_BAD_ACCESS" else None
+    if addr is not None:
+        out["fault_address"] = "0x%016x" % addr
+        sc = b.get("sharedCache") or {}
+        if isinstance(sc.get("base"), int) and isinstance(sc.get("size"), int):
+            out["fault_in_shared_cache"] = sc["base"] <= addr < sc["base"] + sc["size"]
+    # same fault, any process: signal + normalized subtype + top 3 symbols (or the fault address if the
+    # report has no frames to use)
+    parts = [ev.get("signal") or ev.get("exception_type") or "", ev.get("subtype_normalized") or ""]
+    syms = frame_symbols(b)
+    if syms:
+        parts += syms
+    elif "fault_address" in out:
+        parts.append(out["fault_address"])
+    out["signature"] = hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
+    return out
+
+
 def app_crash(path, source):
     h, b = split_ips(read_text(path))
+    note_identifiers(b)
     bug = str(h.get("bug_type"))
     if bug == "298":  # jetsam (low-memory kill)
         return {
@@ -312,6 +414,7 @@ def app_crash(path, source):
     m = re.search(r"bytes after start: (\d+)", vm)
     if m:
         ev["fault_offset_in_region"] = int(m.group(1))
+    ev.update(crash_context_fields(h, b, ev))
     return ev
 
 
@@ -387,9 +490,69 @@ def log_events():
                 events[ev["event_id"]] = ev  # dedupe lines seen in overlapping log exports
     return list(events.values())
 
+PMSET_LINE_RX = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}) (\S+(?: \S+)*?)\s*\t(.*?)\s*$")
+PMSET_WAKE_RX = re.compile(r"^(Wake|DarkWake) from (.*?)\s*\[[^\]]*\]\s*:\s*due to (.*?) Using (\w+) \(Charge:(\d+)%\)(?:\s+(\d+) secs)?")
+PMSET_SLEEP_RX = re.compile(r"^Entering (\w+) state due to '([^']*)'.*?Using (\w+) \(Charge:(\d+)%\)(?:\s+(\d+) secs)?")
+
+
+def pmset_events():
+    """power_event (sleep / wake / darkwake) and boot events from `pmset -g log` lines saved by update.sh in
+    data/system-info/pmset/. Everything is what macOS itself printed: nothing is inferred or labelled.
+    `secs_printed` is the number macOS prints at the end of the line; its meaning is not asserted here.
+    Session UUID lines in that log are identifiers and are not read."""
+    events = {}
+    starts, causes = [], []
+    for p in sorted(glob.glob(os.path.join(SYSINFO, "pmset", "*.txt"))):
+        for line in read_text(p).splitlines():
+            m = PMSET_LINE_RX.match(line)
+            if not m:
+                continue
+            ts_raw, domain, msg = m.groups()
+            ts = parse_ts(ts_raw)
+            ev = None
+            if domain in ("Wake", "DarkWake"):
+                w = PMSET_WAKE_RX.match(msg)
+                ev = {"power_event": domain.lower()}
+                if w:
+                    ev.update({"wake_from": w.group(2), "reason": w.group(3), "power_source": w.group(4).lower(),
+                               "charge_pct": int(w.group(5))})
+                    if w.group(6):
+                        ev["secs_printed"] = int(w.group(6))
+            elif domain == "Sleep":
+                s = PMSET_SLEEP_RX.match(msg)
+                ev = {"power_event": "sleep"}
+                if s:
+                    # macOS prints "Entering Sleep state" or "Entering DarkWake state" on these lines
+                    ev.update({"to_state": s.group(1), "reason": s.group(2), "power_source": s.group(3).lower(),
+                               "charge_pct": int(s.group(4))})
+                    if s.group(5):
+                        ev["secs_printed"] = int(s.group(5))
+            elif domain == "Start" and "powerd process is started" in msg:
+                starts.append((ts, ts_raw, msg, p))
+            elif domain == "ShutdownCause":
+                c = re.match(r"SMC shutdown cause: (-?\d+):\s*(.*)$", msg)
+                if c:
+                    causes.append((ts, int(c.group(1)), c.group(2).strip()))
+            if ev:
+                ev.update({"category": "power_event", "source": "pmset_log", "process": "powerd", "ts": ts,
+                           "message": msg[:300], "file": rel(p), "event_id": event_id("pmset", ts_raw, domain, msg)})
+                events[ev["event_id"]] = ev
+    for ts, ts_raw, msg, p in starts:
+        ev = {"category": "boot", "source": "pmset_log", "process": "powerd", "ts": ts, "message": msg,
+              "file": rel(p), "event_id": event_id("pmset", ts_raw, "Start", msg)}
+        # the shutdown-cause line macOS printed just before this start, if any (within 2 minutes)
+        prior = [c for c in causes if c[0] <= ts and (iso_to_dt(ts) - iso_to_dt(c[0])).total_seconds() <= 120]
+        if prior:
+            _, code, text = max(prior)
+            ev["smc_shutdown_cause"] = code
+            if text:
+                ev["smc_shutdown_cause_text"] = text  # only what macOS printed; -20 prints no text
+        events[ev["event_id"]] = ev
+    return list(events.values())
+
 # ----------------------------------------------------------------------------- main
 
-SKIP = re.compile(r"(deviceMetadata\.proxy|ResetCounter-|\.DS_Store)$")
+SKIP =re.compile(r"(deviceMetadata\.proxy|ResetCounter-|\.DS_Store)$")
 
 
 def collect():
@@ -417,6 +580,7 @@ def collect():
                 ev["event_id"] = event_id(ev["file"])
                 events.append(ev)
     events.extend(log_events())
+    events.extend(pmset_events())
     host_label = ENV.get("HOST_LABEL") or "mac"
     for ev in events:
         ev["host"] = host_label
@@ -429,6 +593,14 @@ def collect():
 
 
 def main():
+    if "--emit-identifiers" in sys.argv:
+        # internal: used by check_public.sh to grep tracked files. Prints identifier values; don't run in a
+        # shared terminal or paste the output anywhere.
+        for source in ("system", "user", "bridge"):
+            for path in glob.glob(os.path.join(RAW, source, "*.ips")):
+                note_identifiers(split_ips(read_text(path))[1])
+        print("\n".join(sorted(SEEN_IDENTIFIERS)))
+        return
     if not ENV:
         print("warning: no .env found. Run scripts/setup_env.sh first so identifiers get scrubbed.", file=sys.stderr)
     events = collect()
