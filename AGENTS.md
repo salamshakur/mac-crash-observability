@@ -13,6 +13,10 @@ dashboards. See `README.md` (usage, event schema) and `observability/README.md` 
   (`<SERIAL>`, `C02XXXXXXXXX`).
 - Never hard-code identifiers. New identifiers go in `.env.example` (blank), get detected in
   `scripts/setup_env.sh`, and get scrubbed via `SCRUB_KEYS` in `scripts/build_index.py`.
+- Identifiers that live inside reports rather than in `.env` (`crashReporterKey`,
+  `storeInfo.deviceIdentifierForVendor`, `sleepWakeUUID`, raw `bootSessionUUID`, and the UUID lines in
+  `pmset -g log`) are never written to the index. Use a one-way hash (`boot_id`) when you need to group by them.
+  New ones go in `IDENTIFIER_FIELDS` in `scripts/build_index.py`; `check_public.sh` greps tracked files for them.
 - Before committing, run `scripts/check_public.sh` (the pre-commit hook does this when installed via
   `scripts/install_hooks.sh`).
 - Raw reports in `data/raw/` are evidence: read them, never modify or delete them.

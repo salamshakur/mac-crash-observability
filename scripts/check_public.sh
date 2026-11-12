@@ -30,6 +30,18 @@ if [ -n "$user" ] && hits=$(git grep $MODE -I -l -F -e "/Users/$user" -- . ':!.e
   echo "✗ /Users/$user found in:"; echo "$hits" | sed 's/^/    /'; fail=1
 fi
 
+# Identifiers that live inside the reports rather than in .env: crashReporterKey, vendor ID, boot and
+# sleep/wake session UUIDs. build_index.py collects them from data/raw/ (values are never printed here).
+if [ -d data/raw ]; then
+  idfile="$(mktemp)"
+  trap 'rm -f "$idfile"' EXIT
+  python3 scripts/build_index.py --emit-identifiers > "$idfile" 2>/dev/null || true
+  if [ -s "$idfile" ] && hits=$(git grep $MODE -I -i -l -F -f "$idfile" -- . ':!.env' 2>/dev/null); then
+    echo "✗ a per-report identifier (crashReporterKey, session UUID or vendor ID) found in:"
+    echo "$hits" | sed 's/^/    /'; fail=1
+  fi
+fi
+
 if [ $fail -eq 1 ]; then
   echo "Refusing: identifiers would be published. Re-run scripts/build_index.py or unstage those files."
   exit 1
